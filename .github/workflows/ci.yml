@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run lint
+      # Le build importe firebase-admin et Stripe : valeurs factices de .env.example
+      # + service account jetable généré à la volée (aucun accès réel).
+      - name: Build
+        run: |
+          sed -e 's/^NEXT_PUBLIC_FIREBASE_API_KEY=$/NEXT_PUBLIC_FIREBASE_API_KEY=demo/' \
+              -e 's/^NEXT_PUBLIC_FIREBASE_PROJECT_ID=$/NEXT_PUBLIC_FIREBASE_PROJECT_ID=demo-ci/' \
+              -e '/^FIREBASE_ADMIN_SA=$/d' .env.example > .env.local
+          openssl genrsa -out /tmp/ci.pem 2048
+          node -e '
+            const fs = require("fs");
+            const sa = { type: "service_account", project_id: "demo-ci", private_key_id: "ci",
+              private_key: fs.readFileSync("/tmp/ci.pem", "utf8"),
+              client_email: "ci@demo-ci.iam.gserviceaccount.com", client_id: "0",
+              token_uri: "https://oauth2.googleapis.com/token" };
+            fs.appendFileSync(".env.local", "\nFIREBASE_ADMIN_SA=" +
+              Buffer.from(JSON.stringify(sa)).toString("base64") + "\n");'
+          npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1

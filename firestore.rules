@@ -1,0 +1,207 @@
+rules_version = '2';
+
+// ───────────────────────────────────────────────────────────────────
+// Boumly — règles Firestore de production
+//
+// Modèle de sécurité :
+//  • users   : privé, chaque utilisateur ne voit/écrit que son propre doc
+//  • stores  : lecture publique (vitrine), écriture réservée au propriétaire,
+//              champs Stripe verrouillés (écrits côté serveur via Admin SDK)
+//  • products: lecture publique (vitrine), écriture réservée au créateur
+//  • orders  : créées UNIQUEMENT côté serveur (Admin SDK, ignore ces règles).
+//              Lecture par le vendeur de la boutique ou le client connecté.
+//              Mise à jour limitée au statut par le vendeur.
+//
+// L'Admin SDK (routes /api, webhooks Stripe) IGNORE ces règles : toute la
+// logique sensible (paiement, montants, champs Stripe) passe par lui.
+// ───────────────────────────────────────────────────────────────────
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isUser(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // Clés modifiées par une mise à jour
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // ─── users/{uid} ───────────────────────────────────────────────
+    match /users/{uid} {
+      allow read:   if isUser(uid);
+      allow create: if isUser(uid)
+                    && request.resource.data.id == uid;
+      // id non modifiable + champs Stripe Connect organisateur verrouillés
+      // (écrits côté serveur via Admin SDK lors de l'onboarding organisateur).
+      allow update: if isUser(uid)
+                    && request.resource.data.id == uid
+                    && !changed().hasAny([
+                         'stripeAccountId',
+                         'stripeChargesEnabled',
+                         'stripePayoutsEnabled',
+                         'stripeVerificationState'
+                       ]);
+      allow delete: if false;
+    }
+
+    // ─── stores/{storeId}  (doc id == uid du propriétaire) ──────────
+    match /stores/{storeId} {
+      // Vitrine publique : lecture libre (y compris visiteurs anonymes)
+      allow read: if true;
+
+      allow create: if isUser(storeId)
+                    && request.resource.data.id == storeId
+                    && request.resource.data.ownerId == storeId;
+
+      // Propriétaire uniquement, et interdiction de toucher aux champs
+      // gérés par le serveur (Stripe Connect, identité de la boutique).
+      // `country` est verrouillé dès qu'un compte connecté existe : il fixe le
+      // pays Stripe (immuable) + la devise de règlement → le changer après
+      // l'onboarding désynchroniserait devise de présentation et de règlement.
+      allow update: if isUser(storeId)
+                    && !changed().hasAny([
+                         'id', 'ownerId',
+                         'stripeAccountId',
+                         'stripeChargesEnabled',
+                         'stripePayoutsEnabled',
+                         'stripeVerificationState'
+                       ])
+                    && (
+                         !('stripeAccountId' in resource.data)
+                         || !changed().hasAny(['country'])
+                       );
+
+      allow delete: if false;
+    }
+
+    // ─── products/{productId} ──────────────────────────────────────
+    match /products/{productId} {
+      // Vitrine publique
+      allow read: if true;
+
+      allow create: if signedIn()
+                    && request.resource.data.creatorId == request.auth.uid;
+
+      // Créateur uniquement ; creatorId non réattribuable
+      allow update: if signedIn()
+                    && resource.data.creatorId == request.auth.uid
+                    && request.resource.data.creatorId == resource.data.creatorId;
+
+      allow delete: if signedIn()
+                    && resource.data.creatorId == request.auth.uid;
+    }
+
+    // ─── promoCodes/{id}  (doc id == "{storeId}_{CODE}") ───────────
+    // Codes promo d'une boutique. PAS de lecture publique : la validation
+    // côté client passe par une route serveur (Admin SDK), on n'expose
+    // jamais la liste des codes. usedCount est incrémenté par l'Admin SDK
+    // (webhook Stripe) qui ignore ces règles.
+    match /promoCodes/{id} {
+      allow read:   if signedIn() && request.auth.uid == resource.data.storeId;
+
+      allow create: if signedIn()
+                    && request.resource.data.storeId == request.auth.uid;
+
+      // Propriétaire uniquement ; storeId non réattribuable.
+      allow update: if signedIn()
+                    && resource.data.storeId == request.auth.uid
+                    && request.resource.data.storeId == resource.data.storeId;
+
+      allow delete: if signedIn()
+                    && resource.data.storeId == request.auth.uid;
+    }
+
+    // ─── orders/{orderId} ──────────────────────────────────────────
+    match /orders/{orderId} {
+      // Création : serveur uniquement (Admin SDK). Client interdit.
+      allow create: if false;
+
+      // Lecture : vendeur de la boutique (uid == storeId) OU client propriétaire.
+      // ⚠️ Les visiteurs anonymes (commande sans compte) ne peuvent PAS lire :
+      //    la page de confirmation/paiement doit lire via une route serveur.
+      allow read: if signedIn() && (
+                       request.auth.uid == resource.data.storeId
+                    || request.auth.uid == resource.data.customerId
+                  );
+
+      // Le vendeur peut faire avancer le statut, rien d'autre.
+      allow update: if signedIn()
+                    && request.auth.uid == resource.data.storeId
+                    && changed().hasOnly(['status'])
+                    && request.resource.data.status in
+                         ['new', 'preparing', 'ready', 'completed'];
+
+      allow delete: if false;
+    }
+
+    // ─── events/{eventId} ──────────────────────────────────────────
+    // Page publique : lecture libre uniquement quand l'événement est publié.
+    // L'organisateur lit/écrit ses propres événements (y compris brouillons).
+    // slug, inviteCode et les champs Stripe (miroir) sont écrits côté serveur
+    // (Admin SDK) : verrouillés ici.
+    match /events/{eventId} {
+      allow read: if resource.data.status == 'published'
+                  || (signedIn() && request.auth.uid == resource.data.organizerId);
+
+      // Création/édition côté serveur uniquement (Admin SDK) : slug + inviteCode
+      // générés serveur, unicité vérifiée, champs Stripe écrits par le webhook.
+      allow create, update, delete: if false;
+    }
+
+    // ─── eventRegistrations/{id} ───────────────────────────────────
+    // Créées UNIQUEMENT côté serveur (Admin SDK) — comme orders.
+    // Lecture par l'artisan (userId) ou l'organisateur de l'événement (organizerId).
+    match /eventRegistrations/{id} {
+      allow create: if false;
+
+      allow read: if signedIn() && (
+                       request.auth.uid == resource.data.userId
+                    || request.auth.uid == resource.data.organizerId
+                  );
+
+      // Transitions de statut + paiement gérées côté serveur uniquement.
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ─── prestations/{id}  (ateliers — produit de la boutique) ─────
+    // Page publique : lecture libre quand la prestation est active.
+    // Le créateur (boutiqueId == uid) lit aussi ses prestations inactives.
+    // slug/currency/champs Stripe (miroir) écrits côté serveur : verrouillés.
+    match /prestations/{prestationId} {
+      allow read: if resource.data.actif == true
+                  || (signedIn() && request.auth.uid == resource.data.boutiqueId);
+      allow create, update, delete: if false;
+    }
+
+    // ─── creneaux/{id}  (occurrences de créneaux) ──────────────────
+    // Lecture publique (planning affiché sur la page de réservation).
+    // Capacité/statut gérés côté serveur uniquement (Admin SDK).
+    match /creneaux/{creneauId} {
+      allow read: if true;
+      allow create, update, delete: if false;
+    }
+
+    // ─── reservations/{id} ─────────────────────────────────────────
+    // Créées UNIQUEMENT côté serveur (Admin SDK) — comme orders.
+    // Lecture par le client (clientId) ou le créateur (boutiqueId).
+    match /reservations/{id} {
+      allow read: if signedIn() && (
+                       request.auth.uid == resource.data.clientId
+                    || request.auth.uid == resource.data.boutiqueId
+                  );
+      allow create, update, delete: if false;
+    }
+
+    // ─── Tout le reste : refus par défaut ──────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
